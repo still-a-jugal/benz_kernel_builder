@@ -1,4 +1,4 @@
-name: Build Kernel (BakaSU + SUSFS + NoMount)
+name: LineageOS_Kernel_CI
 
 # Builds the LineageOS OnePlus SM8550 kernel with BakaSU, SUSFS and NoMount,
 # packages it with AnyKernel3 and (optionally) publishes it as a GitHub release.

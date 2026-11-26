@@ -69,7 +69,7 @@ jobs:
           sudo docker image prune --all --force
           df -h /
 
-      # gki_defconfig enables full LTO, whose final link needs a lot of memory.
+      # The ThinLTO link (vmlinux) still needs more memory than the runner has.
       - name: Set up swap
         run: |
           sudo swapoff -a
@@ -156,6 +156,10 @@ jobs:
           # NoMount
           CONFIG_NOMOUNT=y
 
+          # Use ThinLTO instead of the full LTO enabled by gki_defconfig
+          CONFIG_LTO_CLANG_THIN=y
+          # CONFIG_LTO_CLANG_FULL is not set
+
           # Don't fail the build on new warnings from a newer clang than the tree was tested with
           # CONFIG_WERROR is not set
           EOF
@@ -165,7 +169,7 @@ jobs:
           make $MAKE_FLAGS $KERNEL_CONFIGS
 
           # Kconfig silently drops options with unmet dependencies, so verify the important ones.
-          for option in CONFIG_KSU CONFIG_KSU_SUSFS CONFIG_NOMOUNT; do
+          for option in CONFIG_KSU CONFIG_KSU_SUSFS CONFIG_NOMOUNT CONFIG_LTO_CLANG_THIN; do
             if ! grep -qx "${option}=y" out/.config; then
               echo "::error::${option} is not enabled in the final .config"
               exit 1
@@ -254,3 +258,4 @@ jobs:
             | SUSFS | `${{ env.SUSFS_VERSION }}` (`${{ env.SUSFS_BRANCH }}`) |
             | NoMount | `${{ env.NOMOUNT_VERSION }}` |
             | Clang | `clang-r596125` |
+            | LTO | ThinLTO |

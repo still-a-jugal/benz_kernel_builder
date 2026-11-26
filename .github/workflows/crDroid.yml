@@ -1,0 +1,256 @@
+name: Build Kernel (BakaSU + SUSFS + NoMount)
+
+# Builds the crDroid OnePlus SM8550 kernel with BakaSU, SUSFS and NoMount,
+# packages it with AnyKernel3 and (optionally) publishes it as a GitHub release.
+
+on:
+  workflow_dispatch:
+    inputs:
+      make_release:
+        description: "Publish the AnyKernel3 zip as a GitHub release"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+env:
+  # Sources
+  KERNEL_REPO: https://github.com/crdroidandroid/android_kernel_oneplus_sm8550.git
+  MODULES_REPO: https://github.com/crdroidandroid/android_kernel_oneplus_sm8550-modules.git
+  KERNEL_BRANCH: "17.0"
+  CLANG_URL: https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android17-release/clang-r596125.tar.gz
+  BAKASU_SETUP_URL: https://raw.githubusercontent.com/Baka-SU/BakaSU/main/kernel/setup.sh
+  BAKASU_REF: main
+  NOMOUNT_SETUP_URL: https://raw.githubusercontent.com/maxsteeel/nomount/refs/heads/dev/kernel/setup.sh
+  SUSFS_REPO: https://gitlab.com/simonpunk/susfs4ksu.git
+  SUSFS_BRANCH: gki-android13-5.15
+  ANYKERNEL_REPO: https://github.com/osm0sis/AnyKernel3.git
+  ANYKERNEL_BRANCH: master
+
+  # Same config fragments crDroid uses (device/oneplus/sm8550-common: TARGET_KERNEL_CONFIG),
+  # followed by our own fragment that enables BakaSU, SUSFS and NoMount.
+  KERNEL_CONFIGS: >-
+    gki_defconfig
+    vendor/kalama_GKI.config
+    vendor/oplus/kalama_GKI.config
+    vendor/debugfs.config
+    custom.config
+  MAKE_FLAGS: >-
+    O=out
+    ARCH=arm64
+    LLVM=1
+    LLVM_IAS=1
+    CROSS_COMPILE=aarch64-linux-gnu-
+    CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
+
+  # Layout: the kernel tree contains symlinks to ../sm8550-modules, so both
+  # repositories must be cloned side by side with these exact directory names.
+  KERNEL_DIR: ${{ github.workspace }}/kernel/sm8550
+  MODULES_DIR: ${{ github.workspace }}/kernel/sm8550-modules
+  CLANG_DIR: ${{ github.workspace }}/toolchain/clang
+  SUSFS_DIR: ${{ github.workspace }}/susfs4ksu
+  ANYKERNEL_DIR: ${{ github.workspace }}/AnyKernel3
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: Build and package kernel
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          df -h /
+
+      # gki_defconfig enables full LTO, whose final link needs a lot of memory.
+      - name: Set up swap
+        run: |
+          sudo swapoff -a
+          sudo rm -f /mnt/swapfile
+          sudo fallocate -l 16G /mnt/swapfile
+          sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile
+          sudo swapon /mnt/swapfile
+          free -h
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential cpio curl dwarves flex git \
+            libelf-dev libssl-dev lz4 python3 zip
+
+      - name: Clone kernel source and modules
+        run: |
+          git clone --depth=1 --branch "$KERNEL_BRANCH" "$KERNEL_REPO" "$KERNEL_DIR"
+          git clone --depth=1 --branch "$KERNEL_BRANCH" "$MODULES_REPO" "$MODULES_DIR"
+
+      - name: Download AOSP clang
+        run: |
+          mkdir -p "$CLANG_DIR"
+          curl -fL "$CLANG_URL" | tar -xz -C "$CLANG_DIR"
+          echo "$CLANG_DIR/bin" >> "$GITHUB_PATH"
+          "$CLANG_DIR/bin/clang" --version
+
+      - name: Integrate BakaSU
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          curl -fLSs "$BAKASU_SETUP_URL" | bash -s "$BAKASU_REF"
+
+          # Same version code formula as BakaSU's Kbuild (30000 + commit count + 700).
+          echo "BAKASU_VERSION=$((30700 + $(git -C KernelSU rev-list --count HEAD)))" >> "$GITHUB_ENV"
+          echo "BAKASU_COMMIT=$(git -C KernelSU rev-parse --short=8 HEAD)" >> "$GITHUB_ENV"
+
+      - name: Integrate NoMount
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          curl -fLSs "$NOMOUNT_SETUP_URL" | bash -
+
+          echo "NOMOUNT_VERSION=$(git -C NoMount describe --tags --always)" >> "$GITHUB_ENV"
+
+      - name: Apply SUSFS patches
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          git clone --depth=1 --branch "$SUSFS_BRANCH" "$SUSFS_REPO" "$SUSFS_DIR"
+
+          cp -r "$SUSFS_DIR"/kernel_patches/fs/* fs/
+          cp -r "$SUSFS_DIR"/kernel_patches/include/linux/* include/linux/
+
+          if ! patch -p1 --forward --no-backup-if-mismatch < "$SUSFS_DIR/kernel_patches/50_add_susfs_in_${SUSFS_BRANCH}.patch"; then
+            echo "::error::SUSFS patch did not apply cleanly"
+            find . -name '*.rej' -print -exec cat {} \;
+            exit 1
+          fi
+
+          echo "SUSFS_VERSION=$(grep '#define SUSFS_VERSION' include/linux/susfs.h | cut -d'"' -f2)" >> "$GITHUB_ENV"
+
+      - name: Configure kernel
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          cat > arch/arm64/configs/custom.config <<'EOF'
+          # BakaSU, hooked through the SUSFS inline hooks
+          CONFIG_KSU=y
+          CONFIG_KSU_SUSFS=y
+          # CONFIG_KSU_TRACEPOINT_HOOK is not set
+          # CONFIG_KSU_MANUAL_HOOK is not set
+
+          # SUSFS features
+          CONFIG_KSU_SUSFS_SUS_PATH=y
+          CONFIG_KSU_SUSFS_SUS_MOUNT=y
+          CONFIG_KSU_SUSFS_SUS_KSTAT=y
+          CONFIG_KSU_SUSFS_SPOOF_UNAME=y
+          CONFIG_KSU_SUSFS_ENABLE_LOG=y
+          CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
+          CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
+          CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
+          CONFIG_KSU_SUSFS_SUS_MAP=y
+          CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER=y
+
+          # NoMount
+          CONFIG_NOMOUNT=y
+
+          # Don't fail the build on new warnings from a newer clang than the tree was tested with
+          # CONFIG_WERROR is not set
+          EOF
+
+          # MAKE_FLAGS and KERNEL_CONFIGS are space-separated lists and are meant to be word-split.
+          # shellcheck disable=SC2086
+          make $MAKE_FLAGS $KERNEL_CONFIGS
+
+          # Kconfig silently drops options with unmet dependencies, so verify the important ones.
+          for option in CONFIG_KSU CONFIG_KSU_SUSFS CONFIG_NOMOUNT; do
+            if ! grep -qx "${option}=y" out/.config; then
+              echo "::error::${option} is not enabled in the final .config"
+              exit 1
+            fi
+          done
+
+          # shellcheck disable=SC2086
+          echo "KERNEL_VERSION=$(make -s $MAKE_FLAGS kernelversion)" >> "$GITHUB_ENV"
+
+      - name: Build kernel
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          # shellcheck disable=SC2086
+          make $MAKE_FLAGS -j"$(nproc)" Image
+          ls -lh out/arch/arm64/boot/Image
+
+      - name: Package AnyKernel3 zip
+        run: |
+          git clone --depth=1 --branch "$ANYKERNEL_BRANCH" "$ANYKERNEL_REPO" "$ANYKERNEL_DIR"
+          cd "$ANYKERNEL_DIR"
+          rm -rf .git .github README.md
+
+          # GKI device with header v4: only the kernel inside the boot partition is replaced.
+          # Device check is disabled because crDroid device props vary across SM8550 OnePlus models.
+          cat > anykernel.sh <<'EOF'
+          ### AnyKernel3 Ramdisk Mod Script
+          ## osm0sis @ xda-developers
+
+          ### AnyKernel setup
+          # global properties
+          properties() { '
+          kernel.string=crDroid OnePlus SM8550 kernel with BakaSU, SUSFS and NoMount
+          do.devicecheck=0
+          do.modules=0
+          do.systemless=1
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=
+          supported.versions=
+          supported.patchlevels=
+          supported.vendorpatchlevels=
+          '; } # end properties
+
+          ### AnyKernel install
+          # boot shell variables
+          BLOCK=boot;
+          IS_SLOT_DEVICE=auto;
+          RAMDISK_COMPRESSION=auto;
+          PATCH_VBMETA_FLAG=auto;
+
+          # import functions/variables and setup patching - see for reference (DO NOT REMOVE)
+          . tools/ak3-core.sh;
+
+          # boot install: the ramdisk lives in init_boot, so skip unpacking/repacking it
+          split_boot;
+          flash_boot;
+          ## end boot install
+          EOF
+
+          cp "$KERNEL_DIR/out/arch/arm64/boot/Image" .
+
+          ZIP_NAME="AnyKernel3-SM8550-${KERNEL_VERSION}-BakaSU-SUSFS-NoMount-$(date +%Y%m%d).zip"
+          zip -r9 "$GITHUB_WORKSPACE/$ZIP_NAME" .
+          echo "ZIP_NAME=$ZIP_NAME" >> "$GITHUB_ENV"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ZIP_NAME }}
+          path: ${{ env.ZIP_NAME }}
+
+      - name: Publish GitHub release
+        if: ${{ inputs.make_release }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: sm8550-${{ env.KERNEL_VERSION }}-r${{ github.run_number }}
+          name: SM8550 ${{ env.KERNEL_VERSION }} - BakaSU + SUSFS + NoMount (#${{ github.run_number }})
+          files: ${{ env.ZIP_NAME }}
+          body: |
+            crDroid OnePlus SM8550 kernel (`${{ env.KERNEL_BRANCH }}`) packaged with AnyKernel3.
+
+            | Component | Version |
+            | --- | --- |
+            | Kernel | `${{ env.KERNEL_VERSION }}` |
+            | BakaSU | `${{ env.BAKASU_VERSION }}` (`${{ env.BAKASU_COMMIT }}`) |
+            | SUSFS | `${{ env.SUSFS_VERSION }}` (`${{ env.SUSFS_BRANCH }}`) |
+            | NoMount | `${{ env.NOMOUNT_VERSION }}` |
+            | Clang | `clang-r596125` |
